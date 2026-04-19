@@ -10,9 +10,16 @@ cat .claude/watcher.pid 2>/dev/null && echo "Watcher: running (PID $(cat .claude
 If not running, print this advisory (do not block or prompt):
 ```
 Watcher: not running
-  Start with: python -m app.cli watcher                          # respects each manifest's implementation_mode
-  Start with: python -m app.cli watcher --worker-mode cloud      # force cloud for all tickets
-  Start with: python -m app.cli watcher --worker-mode local      # force local (RTX 5090 required)
+
+  Cloud mode (Anthropic API):
+    python -m app.cli watcher --worker-mode cloud
+
+  Local mode (RTX 5090 + Ollama — pre-warm GPU first):
+    set OLLAMA_KEEP_ALIVE=-1 && ollama run qwen3-coder:30b ""      # loads model into VRAM indefinitely; exit immediately after
+    python -m app.cli watcher --worker-mode local
+
+  Auto mode (uses each manifest's implementation_mode):
+    python -m app.cli watcher
 ```
 
 ### 0. Clean up local branches
@@ -81,6 +88,7 @@ If no siblings are In Progress, skip this block silently.
 - List what new tests are needed (file, test name, what it verifies)
 - Flag any security surface introduced: new I/O, user input handling, file operations, subprocess calls
 - Note edge cases and overwrite behavior to consider
+- Assess local-model suitability: is the scope bounded (≤3 small/medium files, straightforward wiring)? Or does it touch large/complex modules (e.g. watcher.py, generator.py) requiring multi-step reasoning across many dependencies? Record your conclusion — it determines `implementation_mode` in the manifest.
 
 ### 3. Create the branch and update Linear
 Using the branch name from Linear's "Copy branch name" format (usually `WOR-NNN-short-description`):
@@ -91,15 +99,17 @@ git checkout <epic-branch>
 git pull origin <epic-branch>
 git checkout -b <sub-ticket-branch>
 git push -u origin <sub-ticket-branch>
+git checkout main
 ```
-Then call `EnterWorktree` so this session operates in the sub-ticket branch's worktree, isolated from other parallel sessions.
+The final `git checkout main` is required — the watcher uses `git worktree add` to check out the branch in an isolated directory, and git refuses to do that if the branch is already checked out in the main working tree.
 
 **If no parent epic (targeting main):**
 ```bash
 git checkout -b <branch-name>
 git push -u origin <branch-name>
+git checkout main
 ```
-No worktree needed for solo work.
+Same reason — leave main checked out so the watcher can worktree the sub-ticket branch.
 
 **If the parent epic was previously Backlog** (i.e., this is the first sub-ticket being started in this epic), also promote all other Backlog children to **Todo**:
 ```
@@ -114,6 +124,7 @@ Summarize as:
 Branch: <branch-name> (off <epic-branch | main>)
 Milestone: <milestone name> (<progress>%)
 Epic: <parent issue title or "none">
+Implementation mode: <local|cloud> — local-ready label <present → local / absent → cloud>
 Files to change:
   - path/to/file.py — what changes
 Tests to write:
@@ -149,7 +160,7 @@ Construct the manifest from the planning context gathered in steps 1–4:
   "parallel_safe": <true if no file conflicts with In-Progress siblings>,
   "risk_level": "<low|medium|high — from security surface assessment>",
   "risk_flags": ["<any specific risk notes>"],
-  "implementation_mode": "local",
+  "implementation_mode": "<local if ticket has local-ready label, otherwise cloud>",
   "review_mode": "auto",
   "base_branch": "<epic-branch or main>",
   "worker_branch": "<sub-ticket-branch>",
@@ -183,11 +194,26 @@ Construct the manifest from the planning context gathered in steps 1–4:
 
 Write this JSON to `.claude/artifacts/<ticket_id_lower>/manifest.json` (e.g. `.claude/artifacts/wor_80/manifest.json`). Create parent dirs as needed.
 
+> **Path normalization:** `<ticket_id_lower>` is `ticket_id.lower().replace("-", "_")` — hyphens become underscores (e.g. `WOR-127` → `wor_127`). This matches `ArtifactPaths.from_ticket_id()` in `app/core/manifest.py`. Using `wor-127` (hyphen) will cause a "No such file or directory" error at watcher startup.
+
 Then:
 1. Set the ticket to **ReadyForLocal** in Linear: `save_issue(id: "$ARGUMENTS", state: "ReadyForLocal")`
 2. Post a Linear comment with the manifest path: `save_comment(issueId: "$ARGUMENTS", body: "Execution manifest written to .claude/artifacts/<ticket_id_lower>/manifest.json — watcher may now pick up.")`
 
-The cloud preflight is now complete. The local worker will pick this up via `/implement-ticket $ARGUMENTS`.
+The cloud preflight is now complete.
+
+**STOP HERE. Do NOT run `/implement-ticket`. The watcher daemon will pick this ticket up automatically once it detects `ReadyForLocal` state. Your job for this session is done.**
+
+To monitor worker progress once the watcher picks up the ticket:
+```bash
+# Worker log (stdout + stderr from the claude session):
+tail -f .claude/worktrees/<worker-branch>/.claude/worker_<ticket_id_lower>.log
+# e.g. for WOR-62:
+tail -f ".claude/worktrees/wor-62-structured-claudemdj2-for-full_agentic-preset/.claude/worker_wor-62.log"
+
+# Result artifact (written when worker finishes):
+cat .claude/artifacts/<ticket_id_lower>/result.json
+```
 
 ---
 
