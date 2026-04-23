@@ -1,6 +1,27 @@
-Look up the Linear issue with identifier $ARGUMENTS in the repo-scaffold-desktop project using the Linear MCP server. Also fetch `get_issue($ARGUMENTS, includeRelations: true)` to see its milestone, labels, priority, parent epic, and any blocking relations.
+Look up the Linear issue with identifier $ARGUMENTS in the {{ linear_project }} project using the Linear MCP server. Also fetch `get_issue($ARGUMENTS, includeRelations: true)` to see its milestone, labels, priority, parent epic, and any blocking relations.
 
 Work through these phases in order:
+
+### Spike gate
+Check whether the issue carries a label whose name matches **Spike** (case-insensitive).
+
+If the Spike label is present:
+1. Set state to In Progress: `save_issue(id: "$ARGUMENTS", state: "In Progress")`
+2. Post a comment: `save_comment(issueId: "$ARGUMENTS", body: "Spike ticket — implementing interactively (no watcher manifest). See CLAUDE.md spike workflow.")`
+3. Print the following and **STOP** — do not create a branch, do not write a manifest:
+
+```
+This ticket is labelled Spike — interactive implementation required.
+
+Spike tickets bypass the watcher. Implement them interactively:
+  1. Create a branch: git checkout -b <branch-name>
+  2. Investigate and document findings in docs/spikes/<name>.md
+  3. Commit findings with: git commit -m "Part of $ARGUMENTS: ..."
+  4. Run /finalize-ticket to open a PR (review_mode: human — no auto-merge)
+  5. Human reviews before merge; close the Linear ticket manually after merge
+```
+
+**Do not write a ReadyForLocal manifest for Spike tickets.**
 
 ### Watcher status check
 Check whether the watcher daemon is running by reading `.claude/watcher.pid`:
@@ -35,16 +56,16 @@ git branch --merged main | grep -v '^\*\? *main$' | xargs -r git branch -d
 Check whether this ticket has a parent epic (`parentId` from `get_issue` relations):
 
 **If a parent epic exists:**
-- Derive the epic branch name from the epic issue's Linear "Copy branch name" format (e.g. `wor-49-template-system`)
+- Derive the epic branch name using the `epic/wor-NNN-slug` prefix (e.g. `epic/wor-49-template-system`). The `epic/` prefix keeps epic branches out of Linear's `wor-*` branch automation, preventing the epic issue from being moved to InProgressLocal on every push.
 - Check whether that branch exists on the remote:
   ```bash
   git fetch origin
-  git branch -a | grep wor-NN-epic-slug
+  git branch -a | grep epic/wor-NN
   ```
 - If the epic branch does **not** exist yet — create it from main and push it:
   ```bash
-  git checkout -b <epic-branch>
-  git push -u origin <epic-branch>
+  git checkout -b epic/<epic-slug>
+  git push -u origin epic/<epic-slug>
   git checkout main
   ```
 - If it already exists — confirm it is present on origin (no further action needed)
@@ -56,7 +77,7 @@ Check whether this ticket has a parent epic (`parentId` from `get_issue` relatio
 ### 0.6. Coordination check
 Query Linear for sibling tickets in the same epic that are currently In Progress:
 ```
-list_issues(project: "repo-scaffold-desktop", state: "In Progress", parentId: <epicId>)
+list_issues(project: "{{ linear_project }}", state: "In Progress", parentId: <epicId>)
 ```
 For each In-Progress sibling:
 - Show ticket ID, title, branch name
@@ -95,8 +116,8 @@ Using the branch name from Linear's "Copy branch name" format (usually `WOR-NNN-
 
 **If this ticket has a parent epic with an epic branch:**
 ```bash
-git checkout <epic-branch>
-git pull origin <epic-branch>
+git checkout epic/<epic-slug>
+git pull origin epic/<epic-slug>
 git checkout -b <sub-ticket-branch>
 git push -u origin <sub-ticket-branch>
 git checkout main
@@ -113,7 +134,7 @@ Same reason — leave main checked out so the watcher can worktree the sub-ticke
 
 **If the parent epic was previously Backlog** (i.e., this is the first sub-ticket being started in this epic), also promote all other Backlog children to **Todo**:
 ```
-list_issues(project: "repo-scaffold-desktop", parentId: <epicId>, state: "Backlog")
+list_issues(project: "{{ linear_project }}", parentId: <epicId>, state: "Backlog")
 → for each result (excluding the current ticket): save_issue(id: "WOR-X", state: "Todo")
 ```
 "Todo" signals "actively queued in this epic, not yet started" — distinguishes from Backlog items that aren't in scope yet. Skip this step if the epic was already In Progress.
@@ -138,6 +159,14 @@ If parallel-safe sibling tickets exist, append:
 To work in parallel: open a new Claude Code session in this repo and run
 `/start-ticket WOR-NN` for any ticket marked safe above.
 ```
+
+**Interactive implementation recommended** if ALL four conditions hold:
+- `implementation_mode: cloud` (watcher would spawn another cloud session — no local-model benefit)
+- `allowed_paths` contains only `.claude/commands/`, `CLAUDE.md`, `docs/`, or `schemas/` (no production Python)
+- No parallel siblings currently In Progress (no worktree isolation needed)
+- Small scope (≤ 3 files, no complex logic)
+
+If all four apply, note it explicitly: *"This ticket is a good candidate for interactive implementation — skip the manifest and run `/implement-ticket $ARGUMENTS` in this session."*
 
 **STOP HERE. Do not write any code until the human approves this plan.**
 
@@ -181,8 +210,6 @@ Construct the manifest from the planning context gathered in steps 1–4:
   },
   "ticket_state_map": {
     "in_progress_local": "InProgressLocal",
-    "merged_to_epic": "MergedToEpic",
-    "ready_for_review": "EpicReadyForCloudReview",
     "failed": "Blocked"
   },
   "artifact_paths": {
@@ -226,7 +253,7 @@ While reading the codebase to plan this ticket you may have noticed things outsi
 
 **Rules:**
 - Only surface things genuinely encountered while reading — no extra scans
-- Check existing Linear issues first (`list_issues` with `project: "repo-scaffold-desktop"`) to avoid duplicates
+- Check existing Linear issues first (`list_issues` with `project: "{{ linear_project }}"`) to avoid duplicates
 - Maximum 3 suggestions; if you spotted more, keep only the most impactful
 - Do not create anything — present suggestions and wait for approval
 
