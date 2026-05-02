@@ -74,6 +74,40 @@ Check whether this ticket has a parent epic (`parentId` from `get_issue` relatio
 - Warn: "This ticket has no parent epic — branch will target main instead of an epic branch."
 - Continue with the normal main-targeting flow (step 3 will branch off main)
 
+### 0.55. Epic-size charter check (run when parent epic exists)
+
+When the ticket has a parent epic, count the parent's sub-tickets via `list_issues(parentId: <epicId>)` and inspect the parent description for a `**Charter:** <sentence>` line and a `**Sub-ticket budget:** <N>` line.
+
+Skip this check entirely if the parent epic carries the `meta-epic` label (these are long-lived umbrella issues like "Watcher Reliability" that accumulate independent reliability fixes by design).
+
+Exclude sub-tickets in `Done`, `Cancelled`, `Duplicate`, or `MergedToEpic` states from the count — only count open work.
+
+If `count >= 6` (or `count >= budget` if budget is set), surface this prompt to the human and wait for confirmation before proceeding with the rest of `/start-ticket`:
+
+```
+Parent epic <PARENT> "<parent title>" already has <N> open sub-tickets.
+Charter: "<charter line from parent description, or '(no charter set)'>"
+
+Does WOR-NNN "<this ticket title>" directly produce that charter outcome?
+
+  yes — proceed (the ticket aligns with charter; budget pressure noted)
+  no  — re-parent before proceeding:
+        1. Move to standalone (clear parentId)
+        2. Open a Wave 2 epic (sibling to current parent) and re-parent
+        3. Find a more-fit existing parent
+
+Which?
+```
+
+If the human picks `yes`, continue with the rest of `/start-ticket` unchanged.
+
+If the human picks a re-parent option:
+- **(1) Standalone**: `save_issue(id: "$ARGUMENTS", parentId: null)` and continue.
+- **(2) Wave 2**: create the new epic with `save_issue(team: ..., title: "Wave 2 — <theme>", labels: ["Refactor", ...])`, then `save_issue(id: "$ARGUMENTS", parentId: "<new-epic-id>")` and continue.
+- **(3) Different parent**: ask which one, then `save_issue(id: "$ARGUMENTS", parentId: "<new-parent>")` and continue.
+
+This check is the runtime enforcement of the budget that `/groom-ticket` set; it ensures the budget pressure surfaces at start time even if a sub-ticket was filed without re-grooming the parent.
+
 ### 0.6. Coordination check
 Query Linear for sibling tickets in the same epic that are currently In Progress:
 ```
@@ -110,11 +144,19 @@ If no siblings are In Progress, skip this block silently.
 - List what new test files will be created — for each one, add to `risk_flags`: `"<test_file>.py is a new test file — worker must read a sibling test file first for fixture/mock patterns, then run pytest <file> -x immediately after creation"`
 - If any instance methods are being extracted from a class into module-level functions, add to `risk_flags`: `"methods extracted from <ClassName> — grep for patch.object(instance, '<method>') in tests/ and convert to patch('new.module.path.<method>') — patch.object silently does nothing once the method is no longer on the class"`
 - If the ticket involves moving files into a new subpackage, add to `risk_flags`: `"package reorganization — move ALL source files into the subpackage first, update ALL imports in consumers, then write __init__.py LAST — do not run pytest until the move is complete or ModuleNotFoundError will appear on every intermediate check"` — and add a second risk_flag with the explicit old→new module path mapping table for every moved module (e.g. `"patch path migration: app.core.watcher_subprocess → app.core.watcher.watcher_subprocess, app.core.watcher_worktrees → app.core.watcher.watcher_worktrees, ..."`) so the worker can use replace_all=True bulk substitution per file rather than discovering stale paths from test failures
-- If the ticket involves moving files into a new subpackage AND the project has a `.importlinter` file, add to `risk_flags`: `".importlinter must be updated for new module paths AS PART OF this ticket. Trap: when the new subpackage contains a module of the same name as the package (e.g. app/core/watcher/watcher.py inside app/core/watcher/), reference the module by its full dotted path 'app.core.watcher.watcher' — NOT 'app.core.watcher'. The bare package path matches all descendants and import-linter rejects the layers contract with 'Modules have shared descendants'. Run lint-imports immediately after the move to verify."`
 - List what new tests are needed (file, test name, what it verifies)
 - Flag any security surface introduced: new I/O, user input handling, file operations, subprocess calls
 - Note edge cases and overwrite behavior to consider
 - Assess local-model suitability: is the scope bounded (≤3 small/medium files, straightforward wiring)? Or does it touch large/complex modules (e.g. watcher.py, generator.py) requiring multi-step reasoning across many dependencies? Record your conclusion — it determines `implementation_mode` in the manifest.
+- Classify the ticket's effort level using this rule: simple/additive work touching ≤2 files → 'high'; bounded multi-file work → 'xhigh'; complex/large modules or deep cross-file reasoning → 'max'. Record your classification in the manifest.
+- **Taxonomy classification** (WOR-262) — record these 7 dimensions in the manifest. All optional but populate when you can:
+  - `change_type` — one of `additive` (new feature/file), `modification` (existing behavior changes), `refactor` (no behavior change), `removal` (deletion/cleanup), `docs` (markdown / comments only)
+  - `reasoning_demand` 1-5 — how much cross-file reasoning is needed (1 = local change in one function, 5 = touches many modules with non-obvious invariants)
+  - `scope_clarity` 1-5 — how explicit the AC is (1 = vague "improve X", 5 = exact file/line targets and expected behaviour)
+  - `constraint_density` 1-5 — number of hard rules in `implementation_constraints` (1 = none, 5 = many strict gates)
+  - `ac_specificity` 1-5 — how testable the AC is (1 = subjective only, 5 = each bullet maps to an assertion)
+  - `tech_stack` — comma-separated tags of the technologies involved, e.g. `python,sqlite,pydantic` or `markdown,yaml`
+  - `raw_extensions` — JSON array string of file extensions touched, e.g. `[".py",".md"]`
 
 ### 3. Create the branch and update Linear
 Using the branch name from Linear's "Copy branch name" format (usually `WOR-NNN-short-description`):
@@ -177,7 +219,24 @@ If all four apply, note it explicitly: *"This ticket is a good candidate for int
 
 ---
 
-### 4.5. After human approves the plan — generate the execution manifest
+### 2.5. Populate context_snippets from related_files_hint
+
+Before writing the manifest (step 4.6), populate the `context_snippets` field so the
+local worker can read file headers without round-trip Read calls.
+
+For each file path listed in `related_files_hint` (the architect populates this in step 2):
+1. Read the first ~60 lines of the file using the **Read** tool — one Read call per file.
+2. If the file has fewer than 80 lines, read the entire file.
+3. Cap each snippet at **min(80 lines, 3000 characters)** — truncate at whichever limit is hit first.
+4. Store as a JSON object keyed by file path: `{ "<file_path>": "<snippet_content>" }`.
+5. If `related_files_hint` has **more than 10 files**, take only the first 10.
+
+If `related_files_hint` is empty, leave `context_snippets` as null (omit it from the manifest).
+
+Write the populated `context_snippets` object into the manifest at `context_snippets` key
+(see step 4.6 for the full manifest structure).
+
+### 4.6. After human approves the plan — generate the execution manifest
 
 Once the human says to proceed, generate and write an `ExecutionManifest` JSON to disk. This is the handoff artifact the local worker reads — it must not require re-reading Linear or re-planning.
 
@@ -195,6 +254,14 @@ Construct the manifest from the planning context gathered in steps 1–4:
   "risk_level": "<low|medium|high — from security surface assessment>",
   "risk_flags": ["<any specific risk notes>"],
   "implementation_mode": "<local if ticket has local-ready label, otherwise cloud>",
+  "effort": "<high|xhigh|max — effort classification from architect phase>",
+  "change_type": "<additive|modification|refactor|removal|docs — taxonomy>",
+  "reasoning_demand": <1-5: cross-file reasoning depth>,
+  "scope_clarity": <1-5: how explicit the AC is>,
+  "constraint_density": <1-5: number of hard rules>,
+  "ac_specificity": <1-5: how testable the AC is>,
+  "tech_stack": "<comma-separated tags, e.g. 'python,sqlite,pydantic'>",
+  "raw_extensions": "<JSON array string of extensions, e.g. '[\".py\",\".md\"]'>",
   "review_mode": "auto",
   "base_branch": "<epic-branch or main>",
   "worker_branch": "<sub-ticket-branch>",
@@ -217,6 +284,9 @@ Construct the manifest from the planning context gathered in steps 1–4:
     "in_progress_local": "InProgressLocal",
     "failed": "Blocked"
   },
+  "context_snippets": {
+    "<file_path>": "<snippet content, capped at 80 lines / 3000 chars>"
+  },
   "artifact_paths": {
     "result_json": ".claude/artifacts/<ticket_id_lower>/result.json",
     "manifest_copy": ".claude/artifacts/<ticket_id_lower>/manifest.json"
@@ -227,6 +297,8 @@ Construct the manifest from the planning context gathered in steps 1–4:
 Write this JSON to `.claude/artifacts/<ticket_id_lower>/manifest.json` (e.g. `.claude/artifacts/wor_80/manifest.json`). Create parent dirs as needed.
 
 > **Path normalization:** `<ticket_id_lower>` is `ticket_id.lower().replace("-", "_")` — hyphens become underscores (e.g. `WOR-127` → `wor_127`). This matches `ArtifactPaths.from_ticket_id()` in `app/core/manifest.py`. Using `wor-127` (hyphen) will cause a "No such file or directory" error at watcher startup.
+
+**Sync Linear blockedBy with the manifest.** If the manifest's `blocked_by_tickets` field is non-empty (e.g. `"blocked_by_tickets": ["WOR-266"]`), call `save_issue(id: "$ARGUMENTS", blockedBy: [...])` with the same set of ticket identifiers so that Linear's relation matches the manifest. If the list is empty, do not call `save_issue` for blockedBy.
 
 Then:
 1. Set the ticket to **ReadyForLocal** in Linear: `save_issue(id: "$ARGUMENTS", state: "ReadyForLocal")`
